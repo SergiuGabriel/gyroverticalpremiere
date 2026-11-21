@@ -1,0 +1,84 @@
+# Builds the Gyroflow Adobe plugin (vertical sequences) for macOS: .dmg (contains the .pkg installer) + .zip
+# Project lives in the gyroflow-vertical/ subfolder of this repo. Ad-hoc signed, not notarized.
+name: Build Mac DMG (Premiere vertical)
+on: [workflow_dispatch, push]
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: gyroflow-vertical
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+      - uses: extractions/setup-just@v2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo
+            gyroflow-vertical/target
+            gyroflow-vertical/ext
+          key: macos-adobe-vertical-0
+
+      - name: Dependencies
+        run: just install-deps
+
+      - name: Build
+        working-directory: gyroflow-vertical/adobe
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/gyroflow-vertical/target
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          RUSTFLAGS: -L ${{ github.workspace }}/gyroflow-vertical/ext/vcpkg/installed/x64-osx-release/lib/ -L ${{ github.workspace }}/gyroflow-vertical/ext/vcpkg/installed/arm64-osx/lib/
+        run: |
+          cargo build --profile deploy --target x86_64-apple-darwin
+          cargo build --profile deploy --target aarch64-apple-darwin
+
+      - name: Bundle, sign, package (pkg, zip, dmg)
+        run: |
+          set -e
+          cd target
+          # installer pre-script: sets aside an already installed Gyroflow plugin
+          mkdir -p pkgscripts
+          cat > pkgscripts/preinstall <<'SCRIPT'
+          #!/bin/bash
+          DIR="/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore"
+          if [ -d "$DIR/Gyroflow.plugin" ]; then
+              if [ ! -f "$DIR/Gyroflow.plugin/Contents/Resources/vertical-build" ] && [ ! -d "$DIR/Gyroflow-original.backup" ]; then
+                  mv "$DIR/Gyroflow.plugin" "$DIR/Gyroflow-original.backup"
+              else
+                  rm -rf "$DIR/Gyroflow.plugin"
+              fi
+          fi
+          exit 0
+          SCRIPT
+          chmod +x pkgscripts/preinstall
+
+          P=pkgroot/Library/Application\ Support/Adobe/Common/Plug-ins/7.0/MediaCore/Gyroflow.plugin
+          rm -rf pkgroot out dmgroot && mkdir -p "$P/Contents/Resources" "$P/Contents/MacOS" out dmgroot
+          printf "eFKTFXTC" > "$P/Contents/PkgInfo"
+          /usr/libexec/PlistBuddy -c 'add CFBundlePackageType string eFKT' "$P/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'add CFBundleSignature string FXTC' "$P/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'add CFBundleIdentifier string xyz.gyroflow.adobe' "$P/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'add CFBundleVersion string 3.0.0' "$P/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'add CFBundleShortVersionString string 3.0.0-vertical' "$P/Contents/Info.plist"
+          rsrc=$(ls -t x86_64-apple-darwin/deploy/gyroflow_adobe.rsrc x86_64-apple-darwin/deploy/build/gyroflow_adobe.rsrc 2>/dev/null | head -n1)
+          cp "$rsrc" "$P/Contents/Resources/Gyroflow.rsrc"
+          touch "$P/Contents/Resources/vertical-build"
+          lipo x86_64-apple-darwin/deploy/libgyroflow_adobe.dylib aarch64-apple-darwin/deploy/libgyroflow_adobe.dylib -create -output "$P/Contents/MacOS/Gyroflow"
+          codesign --force --deep -s - "$P"
+          codesign -vvvv --deep --verify "$P"
+          (cd "$(dirname "$P")" && ditto -c -k --keepParent Gyroflow.plugin "$OLDPWD/out/Gyroflow-Adobe-macos-vertical.zip")
+          pkgbuild --root pkgroot --identifier xyz.gyroflow.adobe.vertical --version 3.0.0 \
+                   --scripts pkgscripts --install-location / out/Gyroflow-Premiere-Vertical-macOS.pkg
+
+          # DMG with the installer inside
+          cp out/Gyroflow-Premiere-Vertical-macOS.pkg dmgroot/
+          hdiutil create -volname "Gyroflow Premiere Vertical" -srcfolder dmgroot -ov -format UDZO out/Gyroflow-Premiere-Vertical-macOS.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Gyroflow-Premiere-Vertical-macOS
+          path: gyroflow-vertical/target/out/*
