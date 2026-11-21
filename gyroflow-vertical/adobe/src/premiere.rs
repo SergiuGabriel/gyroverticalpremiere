@@ -1,0 +1,341 @@
+
+use premiere as pr;
+use gyroflow_plugin_base::{ *, gyroflow_core::GyroflowCoreError };
+use super::{ parameters::*, sequence_data, CrossThreadInstance, MediaChange, EffectKey };
+
+#[derive(Default)]
+struct PremiereGPU;
+
+impl pr::GpuFilter for PremiereGPU {
+    fn global_init() { }
+    fn global_destroy() { }
+
+    fn get_frame_dependencies(&self, _filter: &pr::GpuFilterData, _render_params: pr::RenderParams, _query_index: &mut i32) -> Result<pr::sys::PrGPUFilterFrameDependency, pr::Error> {
+        Err(pr::Error::NotImplemented)
+    }
+    fn precompute(&self, _filter: &pr::GpuFilterData, _render_params: pr::RenderParams, _index: i32, _frame: pr::sys::PPixHand) -> Result<(), pr::Error> {
+        Err(pr::Error::NotImplemented)
+    }
+    fn render(&self, filter: &pr::GpuFilterData, render_params: pr::RenderParams, frames: *const pr::sys::PPixHand, _frame_count: usize, out_frame: *mut pr::sys::PPixHand) -> Result<(), pr::Error> {
+        let (frames, out_frame) = unsafe {
+            (*filter.instance_ptr).outIsRealtime = 1;
+            (*frames, *out_frame)
+        };
+        let pixel_format = filter.ppix_suite.pixel_format(out_frame).unwrap();
+
+        let in_frame_data = filter.gpu_device_suite.gpu_ppix_data(frames).unwrap();
+        let out_frame_data = filter.gpu_device_suite.gpu_ppix_data(out_frame).unwrap();
+
+        let in_stride = filter.ppix_suite.row_bytes(frames).unwrap();
+        let out_stride = filter.ppix_suite.row_bytes(out_frame).unwrap();
+
+        let in_bounds  = filter.ppix_suite.bounds(frames).unwrap();
+        let out_bounds = filter.ppix_suite.bounds(out_frame).unwrap();
+        let in_size  = ( in_bounds.right -  in_bounds.left,  in_bounds.bottom -  in_bounds.top);
+        let out_size = (out_bounds.right - out_bounds.left, out_bounds.bottom - out_bounds.top);
+
+        if let Ok(pr::PropertyData::Binary(bytes)) = filter.property(pr::Property::Effect_FilterOpaqueData) {
+            if bytes.len() > 2 {
+                // The effect's own instance (see `effect_instances`): the sequence data copied with the effect is another's,
+                // and may be older than the effect's
+                let (version, saved) = (u16::from_le_bytes([bytes[0], bytes[1]]), &bytes[2..]);
+                let key = match filter.property(pr::Property::Effect_RuntimeInstanceID) {
+                    Ok(pr::PropertyData::UInt32(id)) => Some(EffectKey::Filter(id)),
+                    _ => None
+                };
+                let found = key.and_then(|key| CrossThreadInstance { id: sequence_data::saved_id(saved).unwrap_or_default() }.found_for(key));
+                let (inst, own_instance) = match (found, key) {
+                    (Some(inst), _) => (inst, true),
+                    (None, Some(key)) => (CrossThreadInstance::restore(version, saved).of_effect(key, false, Some((version, saved)), false), true),
+                    (None, None) => (CrossThreadInstance::restore(version, saved), false),
+                };
+
+                let inst_id = inst.id;
+                let inst = inst.get().unwrap();
+                let mut inst = inst.write();
+                inst.sync_copies(inst_id);
+
+                let clip_node = filter.video_segment_suite.acquire_operator_owner_node_id(filter.node_id())?;
+                let media_node = filter.video_segment_suite.acquire_input_node_id(clip_node, 0)?;
+
+                {
+                    let keyframe_test = [ Params::Fov, Params::Smoothness, Params::ZoomLimit, Params::LensCorrectionStrength,
+                                          Params::HorizonLockAmount, Params::HorizonLockRoll, Params::VideoSpeed, Params::Rotation,
+                                          Params::AdditionalYaw, Params::AdditionalPitch ];
+                    let mut stored = inst.stored.write();
+                    stored.premiere_keyframed_params.clear();
+                    for kf in keyframe_test {
+                        if let Some(ind) = param_index_for_type(kf, None) {
+                            if filter.next_keyframe_time(ind, -1) != Err(pr::Error::NoKeyframeAfterInTime) {
+                                stored.premiere_keyframed_params.insert(kf);
+                            }
+                        }
+                    }
+                }
+
+                let media_path = match filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_InstanceString) {
+                    Ok(pr::PropertyData::String(media_path)) => media_path,
+                    _ => String::new()
+                };
+                // The sequence's size and the media's pixel aspect, for a clip new to the effect (see `StoredParams::on_clip`)
+                let anamorphic = || {
+                    match (filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_StreamPixelAspectRatioNum),
+                           filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_StreamPixelAspectRatioDen)) {
+                        (Ok(pr::PropertyData::Int32(num)), Ok(pr::PropertyData::Int32(den))) if den != 0 => ((num as f64 / den as f64) * 100.0).round() != 100.0,
+                        _ => false
+                    }
+                };
+                let sequence_size = (render_params.render_width() as usize, render_params.render_height() as usize);
+                if inst.stored.read().media_file_path.is_empty() {
+                    if !media_path.is_empty() {
+                        let mut stored = inst.stored.write();
+                        stored.pending_params_str.insert(Params::ProjectPath, GyroflowPluginBase::get_project_path(&media_path).unwrap_or(media_path.to_owned()));
+                        stored.media_file_path = media_path;
+                        stored.on_clip(sequence_size, anamorphic(), true);
+                    }
+                    if let Ok(pr::PropertyData::Time(media_fps)) = filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_StreamFrameRate) {
+                        inst.stored.write().media_fps_ticks = media_fps;
+                    }
+                    /*filter.video_segment_suite.iterate_node_properties(clip_node, |k, v| {
+                        log::info!("clip_node Property {k:?} = {v:?}");
+                    })?;
+                    filter.video_segment_suite.iterate_node_properties(filter.node_id(), |k, v| {
+                        log::info!("operator Property {k:?} = {v:?}");
+                    })?;
+                    filter.video_segment_suite.iterate_node_properties(media_node.1, |k, v| {
+                        log::info!("Property {k:?} = {v:?}");
+                    })?;*/
+                } else if own_instance {
+                    // Relinked media, at another path than the one stored when the effect was applied, or the effect copied to
+                    // another clip. Premiere reports the proxy apart, but a proxy in place of the media is still the same clip
+                    let proxy_path = match filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_ProxyInstanceString) {
+                        Ok(pr::PropertyData::String(proxy_path)) => proxy_path,
+                        _ => String::new()
+                    };
+                    let is_proxy = |x: &str| !proxy_path.is_empty() && GyroflowPluginBase::same_file(x, &proxy_path);
+                    if !is_proxy(&media_path) && !is_proxy(&inst.stored.read().media_file_path) {
+                        let params = ParamHandler { inner: ParamsInner::Premiere((filter, render_params.clone())), stored: inst.stored.clone() };
+                        let project = || (params.get_string(Params::ProjectPath).unwrap_or_default(), params.get_string(Params::ProjectData).unwrap_or_default());
+                        let change = inst.follow_media(&media_path, project);
+                        if change != MediaChange::None {
+                            if let Ok(pr::PropertyData::Time(media_fps)) = filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_StreamFrameRate) {
+                                inst.stored.write().media_fps_ticks = media_fps;
+                            }
+                        }
+                        if change == MediaChange::OtherClip {
+                            inst.stored.write().on_clip(sequence_size, anamorphic(), false);
+                        }
+                    }
+                }
+
+                static TICKS_PER_SEC: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+                let ticks_per_sec = *TICKS_PER_SEC.get_or_init(|| pr::suites::Time::new().and_then(|x| x.ticks_per_second()).unwrap_or(254016000000) as f64);
+
+                // The clip's rotation in the sequence, for "Clip rotated in sequence" set to Auto
+                let detected_rotation = motion_rotation(filter, clip_node, render_params.clip_time()).unwrap_or(0.0);
+                if inst.stored.read().detected_rotation != detected_rotation {
+                    log::info!("Motion rotation of the clip: {detected_rotation}°");
+                    inst.stored.write().detected_rotation = detected_rotation;
+                }
+
+                let mut params = ParamHandler { inner: ParamsInner::Premiere((filter, render_params.clone())), stored: inst.stored.clone() };
+
+                if params.get_bool(Params::StabilizationSpeedRamp).unwrap_or_default() {
+                    let kf = if let Ok(pr::PropertyData::Keyframes(kf)) = filter.video_segment_suite.node_property(clip_node, pr::Property::Clip_TimeRemapping) {
+                        kf.0.clone()
+                    } else {
+                        String::new()
+                    };
+
+                    let hash = gyroflow_plugin_base::hash_string(&kf);
+                    if inst.stored.read().speed_checksum != hash {
+                        if let Ok(pr::PropertyData::Time(media_fps)) = filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_StreamFrameRate) {
+                            let fps = ticks_per_sec / media_fps as f64;
+
+                            let mut speed_per_frame = Vec::new();
+                            let mut prev_ticks = 0;
+                            let mut prev_new_ticks = 0;
+                            let mut frame = 0;
+                            loop {
+                                let ticks = (frame as f64 * ticks_per_sec / fps).round() as i64;
+                                let new_ticks = filter.video_segment_suite.transform_node_time(clip_node, ticks)?;
+                                if frame > 0 {
+                                    let original_diff = ticks - prev_ticks;
+                                    let new_diff = new_ticks - prev_new_ticks;
+                                    let speed = (new_diff as f64 / original_diff as f64) * 100.0;
+                                    if speed.abs() > 0.001 {
+                                        speed_per_frame.push(speed);
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    speed_per_frame.push(100.0);
+                                }
+                                prev_ticks = ticks;
+                                prev_new_ticks = new_ticks;
+                                frame += 1;
+                                if frame > 5_000_000 { break; }
+                            }
+                            let mut stored = inst.stored.write();
+                            stored.speed_per_frame = speed_per_frame;
+                            stored.speed_checksum = hash;
+                        }
+                    }
+                }
+
+                let path = params.get_string(Params::ProjectPath).unwrap();
+                if path.is_empty() {
+                    return Ok(());
+                }
+                let instance_id = params.get_string(Params::InstanceId).unwrap();
+                let disable_stretch = params.get_bool(Params::DisableStretch).unwrap();
+
+                let out_w = params.get_f64(Params::OutputWidth).unwrap();
+                let out_h = params.get_f64(Params::OutputHeight).unwrap();
+
+                let key = format!("{path}{disable_stretch}{instance_id}");
+                // log::info!("PremiereGPU::render! {pixel_format:?} in: {in_frame_data:?}, out: {out_frame_data:?}, stride: {in_stride}/{out_stride}, bounds: {in_bounds:?}/{out_bounds:?}, disable_stretch: {disable_stretch:?} path: {} instance_id: {instance_id:?} | time: {}", path, render_params.clip_time());
+
+                // A bin subclip has its own time domain: clip_time is relative to the subclip's
+                // start, not to the start of the master media. Media_ContentStart reports where
+                // that domain begins within the master file, and is absent (0) for a plain
+                // master clip, whose clip_time is already master-relative. Gyro data is anchored
+                // to master-file time, so without this every subclip frame gets the sample from
+                // Media_ContentStart earlier.
+                let media_content_start = match filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_ContentStart) {
+                    Ok(pr::PropertyData::Time(start)) => start as i64,
+                    _ => 0
+                };
+
+                let mut trim_range = None;
+                if let Ok(pr::PropertyData::Int64(start)) = filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_InPointMediaTimeAsTicks) {
+                    if let Ok(pr::PropertyData::Int64(end)) = filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_OutPointMediaTimeAsTicks) {
+                        let start = filter.video_segment_suite.transform_node_time(clip_node, start)?;
+                        let end   = filter.video_segment_suite.transform_node_time(clip_node, end)?;
+                        trim_range = Some((start as f64 / ticks_per_sec, end as f64 / ticks_per_sec));
+                    }
+                }
+
+                // let time_interpolation_type = if let Ok(pr::PropertyData::Int32(num)) = filter.video_segment_suite.node_property(media_node.1, pr::Property::Media_StreamTimeInterpolationType) { num } else { 0 };
+
+                let base_inst = inst.gyroflow.as_mut().unwrap();
+                // "Fit to timeline" fits the clip as the sequence shows it: turned back when the host turns it a quarter
+                base_inst.timeline_size = GyroflowPluginBase::rotated_size((render_params.render_width() as _, render_params.render_height() as _), params.host_rotation());
+
+                if let Ok(stab) = base_inst.stab_manager(&mut params, &super::global_inst().gyroflow.manager_cache, (out_size.0 as _, out_size.1 as _), false) {
+                    /*{
+                        let duration_ms = stab.params.read().duration_ms;
+                        let old_range = stab.trim_ranges().first().cloned().unwrap_or((0.0, 1.0));
+                        let old_range_ms = ((old_range.0 * duration_ms).round() as i64, (old_range.1 * duration_ms).round() as i64);
+                        let new_range = trim_range.unwrap_or((0.0, duration_ms / 1000.0));
+                        let new_range_ms = ((new_range.0 * 1000.0).round() as i64, (new_range.1 * 1000.0).round() as i64);
+                        if old_range_ms != new_range_ms {
+                            log::info!("Trim range changed: {:?} != {:?}", old_range_ms, new_range_ms);
+
+                            stab.set_trim_ranges(vec![((new_range.0 * 1000.0) / duration_ms, (new_range.1 * 1000.0) / duration_ms)]);
+                            stab.invalidate_blocking_smoothing();
+                        }
+                    }*/
+                    let fps = stab.params.read().fps;
+
+                    let fps_ticks = inst.stored.read().media_fps_ticks;
+                    let fps_ticks = if fps_ticks == 0 { ticks_per_sec / fps } else { fps_ticks as f64 };
+
+                    // round the timestamp_us according to the fps, so it's never between frames and always points to a valid frame timestamp
+                    let frame = (render_params.clip_time() + media_content_start) as f64 / fps_ticks;
+                    let frame = if frame.fract() > 0.999 { frame.ceil() } else { frame.floor() };
+                    let timestamp_us = (frame * (1_000_000.0 / fps)).round() as i64;
+
+                    let src_size = (in_size.0 as usize, in_size.1 as usize, in_stride as usize);
+                    let dest_size = (out_size.0 as usize, out_size.1 as usize, out_stride as usize);
+                    // let src_rect = GyroflowPluginBase::get_center_rect(in_size.0 as usize, in_size.1 as usize, org_ratio);
+                    let out_rect = GyroflowPluginBase::get_center_rect(out_size.0 as usize, out_size.1 as usize, out_w as f64 / out_h.max(1.0) as f64);
+
+                    let in_ptr = in_frame_data;
+                    let out_ptr = out_frame_data;
+
+                    let api = filter.gpu_info.outDeviceFramework;
+
+                    // log::info!("Render GPU: {in_ptr:?} -> {out_ptr:?}. API: {:?}, pixel_format: {pixel_format:?} {src_rect:?}->{out_rect:?}", api);
+
+                    let buffers = match api {
+                        #[cfg(any(target_os = "windows", target_os = "linux"))]
+                        pr::sys::PrGPUDeviceFramework_PrGPUDeviceFramework_CUDA => (
+                            BufferSource::CUDABuffer { buffer: in_ptr },
+                            BufferSource::CUDABuffer { buffer: out_ptr },
+                            true
+                        ),
+                        #[cfg(any(target_os = "macos", target_os = "ios"))]
+                        pr::sys::PrGPUDeviceFramework_PrGPUDeviceFramework_Metal => (
+                            BufferSource::MetalBuffer { buffer: in_ptr  as *mut std::ffi::c_void, command_queue: filter.gpu_info.outCommandQueueHandle as *mut std::ffi::c_void },
+                            BufferSource::MetalBuffer { buffer: out_ptr as *mut std::ffi::c_void, command_queue: std::ptr::null_mut() },
+                            true
+                        ),
+                        pr::sys::PrGPUDeviceFramework_PrGPUDeviceFramework_OpenCL => (
+                            BufferSource::OpenCL { texture: in_ptr,  queue: filter.gpu_info.outCommandQueueHandle },
+                            BufferSource::OpenCL { texture: out_ptr, queue: std::ptr::null_mut() },
+                            true
+                        ),
+                        _ => panic!("Invalid GPU framework")
+                    };
+
+                    // The clip at its own size, the right way up (see `GyroflowPluginBase::render_geometry`)
+                    let video_size = stab.params.read().size;
+                    let input_rotation = GyroflowPluginBase::render_geometry(video_size, params.get_f64(Params::InputRotation).unwrap_or_default(), (src_size.0, src_size.1), (dest_size.0, dest_size.1), true, false, false).kernel_rotation as f32;
+
+                    let mut buffers = Buffers {
+                        input:  BufferDescription { size: src_size,  rect: None,           data: buffers.0, rotation: Some(input_rotation), texture_copy: buffers.2 },
+                        output: BufferDescription { size: dest_size, rect: Some(out_rect), data: buffers.1, rotation: None,                 texture_copy: buffers.2 }
+                    };
+                    if let Err(e) = match pixel_format {
+                        pr::PixelFormat::GpuBgra4444_32f => stab.process_pixels::<RGBAf>(timestamp_us, None, &mut buffers),
+                        pr::PixelFormat::GpuBgra4444_16f => stab.process_pixels::<RGBAf16>(timestamp_us, None, &mut buffers),
+                        _ => Err(GyroflowCoreError::UnsupportedFormat(format!("{pixel_format:?}")))
+                    } {
+                        log::error!("Failed to process pixels: {e:?}");
+                    }
+                } else {
+                    log::error!("Key not found: {key}");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The rotation of the clip in its sequence, in degrees clockwise: the Rotation of its Motion effect, an operator of the
+/// clip's node like the effects applied to it. Motion's parameters are Position, Scale, Scale Width, Uniform Scale,
+/// Rotation, Anchor Point and Anti-flicker Filter: the rotation is the number right after the one checkbox, which tells it
+/// apart whatever the index of the first parameter. `None` when there's no Motion or it isn't laid out that way
+fn motion_rotation(filter: &pr::GpuFilterData, clip_node: i32, time: i64) -> Option<f64> {
+    let suite = &filter.video_segment_suite;
+    let count = suite.node_operator_count(clip_node).ok()?;
+    for i in 0..count {
+        let Ok(op) = suite.acquire_operator_node_id(clip_node, i) else { continue; };
+        let is_motion = match suite.node_property(op, pr::Property::Effect_FilterMatchName) {
+            Ok(pr::PropertyData::String(name)) => name.ends_with("ADBE Motion") || name == "Motion",
+            _ => false
+        };
+        let mut rotation = None;
+        if is_motion {
+            let params = (0..suite.param_count(op).unwrap_or(0)).map(|j| suite.param(op, j, time).ok()).collect::<Vec<_>>();
+            if let Some(checkbox) = params.iter().position(|x| matches!(x, Some(pr::Param::Bool(_)))) {
+                rotation = match params.get(checkbox + 1) {
+                    Some(Some(pr::Param::Float64(x))) => Some(*x),
+                    Some(Some(pr::Param::Float32(x))) => Some(*x as f64),
+                    _ => None
+                };
+            }
+            if rotation.is_none() {
+                log::warn!("Motion's parameters aren't laid out as expected: {params:?}");
+            }
+        }
+        let _ = suite.release_video_node_id(op);
+        if is_motion {
+            return rotation.filter(|x| x.is_finite());
+        }
+    }
+    None
+}
+
+pr::define_gpu_filter!(PremiereGPU);
